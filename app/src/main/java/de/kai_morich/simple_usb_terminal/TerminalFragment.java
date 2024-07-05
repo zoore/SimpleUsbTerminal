@@ -30,7 +30,6 @@ import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ImageButton;
-import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.widget.ToggleButton;
@@ -44,9 +43,11 @@ import com.hoho.android.usbserial.driver.SerialTimeoutException;
 import com.hoho.android.usbserial.driver.UsbSerialDriver;
 import com.hoho.android.usbserial.driver.UsbSerialPort;
 import com.hoho.android.usbserial.driver.UsbSerialProber;
+import com.hoho.android.usbserial.util.XonXoffFilter;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
 
@@ -63,13 +64,16 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
     private TextView receiveText;
     private TextView sendText;
     private ImageButton sendBtn;
-    private ControlLines controlLines;
     private TextUtil.HexWatcher hexWatcher;
 
     private Connected connected = Connected.False;
     private boolean initialStart = true;
     private boolean hexEnabled = false;
-    private boolean controlLinesEnabled = false;
+    private enum SendButtonState {Idle, Busy, Disabled};
+
+    private ControlLines controlLines = new ControlLines();
+    private XonXoffFilter flowControlFilter;
+
     private boolean pendingNewline = false;
     private String newline = TextUtil.newline_crlf;
 
@@ -145,14 +149,13 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
             initialStart = false;
             getActivity().runOnUiThread(this::connect);
         }
-        if(controlLinesEnabled && controlLines != null && connected == Connected.True)
+        if(connected == Connected.True)
             controlLines.start();
     }
 
     @Override
     public void onPause() {
-        if(controlLines != null)
-            controlLines.stop();
+        controlLines.stop();
         super.onPause();
     }
 
@@ -190,7 +193,7 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
 
         View sendBtn = view.findViewById(R.id.send_btn);
         sendBtn.setOnClickListener(v -> send(sendText.getText().toString()));
-        controlLines = new ControlLines(view);
+        controlLines.onCreateView(view);
         return view;
     }
 
@@ -201,7 +204,7 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
 
     public void onPrepareOptionsMenu(@NonNull Menu menu) {
         menu.findItem(R.id.hex).setChecked(hexEnabled);
-        menu.findItem(R.id.controlLines).setChecked(controlLinesEnabled);
+        controlLines.onPrepareOptionsMenu(menu);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             menu.findItem(R.id.backgroundNotification).setChecked(service != null && service.areNotificationsEnabled());
         } else {
@@ -219,11 +222,11 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
         } else if (id == R.id.newline) {
             String[] newlineNames = getResources().getStringArray(R.array.newline_names);
             String[] newlineValues = getResources().getStringArray(R.array.newline_values);
-            int pos = java.util.Arrays.asList(newlineValues).indexOf(newline);
+            int pos = Arrays.asList(newlineValues).indexOf(newline);
             AlertDialog.Builder builder = new AlertDialog.Builder(getActivity());
             builder.setTitle("Newline");
-            builder.setSingleChoiceItems(newlineNames, pos, (dialog, item1) -> {
-                newline = newlineValues[item1];
+            builder.setSingleChoiceItems(newlineNames, pos, (dialog, which) -> {
+                newline = newlineValues[which];
                 dialog.dismiss();
             });
             builder.create().show();
@@ -236,13 +239,10 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
             item.setChecked(hexEnabled);
             return true;
         } else if (id == R.id.controlLines) {
-            controlLinesEnabled = !controlLinesEnabled;
-            item.setChecked(controlLinesEnabled);
-            if (controlLinesEnabled) {
-                controlLines.start();
-            } else {
-                controlLines.stop();
-            }
+            item.setChecked(controlLines.showControlLines(!item.isChecked()));
+            return true;
+        } else if (id == R.id.flowControl) {
+            controlLines.selectFlowControl();
             return true;
         } else if (id == R.id.backgroundNotification) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -263,9 +263,8 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
                 status("send BREAK failed: " + e.getMessage());
             }
             return true;
-        } else {
-            return super.onOptionsItemSelected(item);
         }
+        return super.onOptionsItemSelected(item);
     }
 
     /*
@@ -337,7 +336,7 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
         connected = Connected.False;
         controlLines.stop();
         service.disconnect();
-        enableSendBtn(true);
+        updateSendBtn(SendButtonState.Idle);
         usbSerialPort = null;
     }
 
@@ -363,8 +362,7 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
             spn.setSpan(new ForegroundColorSpan(getResources().getColor(R.color.colorSendText)), 0, spn.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
             receiveText.append(spn);
             service.write(data);
-        } catch (SerialTimeoutException e) { // e.g. writing large data at low baud rate
-            enableSendBtn(false);
+        } catch (SerialTimeoutException e) { // e.g. writing large data at low baud rate or suspended by flow control
             mainLooper.post(() -> sendAgain(data, e.bytesTransferred));
         } catch (Exception e) {
             onSerialIoError(e);
@@ -372,6 +370,7 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
     }
 
     private void sendAgain(byte[] data0, int offset) {
+        updateSendBtn(controlLines.sendAllowed ? SendButtonState.Busy : SendButtonState.Disabled);
         if (connected != Connected.True) {
             return;
         }
@@ -390,12 +389,14 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
         } catch (Exception e) {
             onSerialIoError(e);
         }
-        enableSendBtn(true);
+        updateSendBtn(controlLines.sendAllowed ? SendButtonState.Idle : SendButtonState.Disabled);
     }
 
     private void receive(ArrayDeque<byte[]> datas) {
         SpannableStringBuilder spn = new SpannableStringBuilder();
         for (byte[] data : datas) {
+            if (flowControlFilter != null)
+                data = flowControlFilter.filter(data);
             if (hexEnabled) {
                 spn.append(TextUtil.toHexString(data)).append('\n');
             } else {
@@ -427,9 +428,10 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
         receiveText.append(spn);
     }
 
-    void enableSendBtn(boolean enable) {
-        sendBtn.setEnabled(enable);
-        sendBtn.setImageAlpha(enable ? 255 : 64);
+    void updateSendBtn(SendButtonState state) {
+        sendBtn.setEnabled(state == SendButtonState.Idle);
+        sendBtn.setImageAlpha(state == SendButtonState.Idle ? 255 : 64);
+        sendBtn.setImageResource(state == SendButtonState.Disabled ? R.drawable.ic_block_white_24dp : R.drawable.ic_send_white_24dp);
     }
 
     /*
@@ -458,8 +460,7 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
     public void onSerialConnect() {
         status("connected");
         connected = Connected.True;
-        if(controlLinesEnabled)
-            controlLines.start();
+        controlLines.start();
     }
 
     @Override
@@ -488,15 +489,21 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
     class ControlLines {
         private static final int refreshInterval = 200; // msec
 
-        private final Handler mainLooper;
         private final Runnable runnable;
-        private final LinearLayout frame;
-        private final ToggleButton rtsBtn, ctsBtn, dtrBtn, dsrBtn, cdBtn, riBtn;
 
-        ControlLines(View view) {
-            mainLooper = new Handler(Looper.getMainLooper());
+        private View frame;
+        private ToggleButton rtsBtn, ctsBtn, dtrBtn, dsrBtn, cdBtn, riBtn;
+
+        private boolean showControlLines;                                               // show & update control line buttons
+        private UsbSerialPort.FlowControl flowControl = UsbSerialPort.FlowControl.NONE; // !NONE: update send button state
+
+        boolean sendAllowed = true;
+
+        ControlLines() {
             runnable = this::run; // w/o explicit Runnable, a new lambda would be created on each postDelayed, which would not be found again by removeCallbacks
+        }
 
+        void onCreateView(View view) {
             frame = view.findViewById(R.id.controlLines);
             rtsBtn = view.findViewById(R.id.controlLineRts);
             ctsBtn = view.findViewById(R.id.controlLineCts);
@@ -506,6 +513,145 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
             riBtn = view.findViewById(R.id.controlLineRi);
             rtsBtn.setOnClickListener(this::toggle);
             dtrBtn.setOnClickListener(this::toggle);
+        }
+
+        void onPrepareOptionsMenu(Menu menu) {
+            try {
+                EnumSet<UsbSerialPort.ControlLine> scl = usbSerialPort.getSupportedControlLines();
+                EnumSet<UsbSerialPort.FlowControl> sfc = usbSerialPort.getSupportedFlowControl();
+                menu.findItem(R.id.controlLines).setEnabled(!scl.isEmpty());
+                menu.findItem(R.id.controlLines).setChecked(showControlLines);
+                menu.findItem(R.id.flowControl).setEnabled(sfc.size() > 1);
+            } catch (Exception ignored) {
+            }
+        }
+
+        void selectFlowControl() {
+            EnumSet<UsbSerialPort.FlowControl> sfc = usbSerialPort.getSupportedFlowControl();
+            UsbSerialPort.FlowControl fc = usbSerialPort.getFlowControl();
+            ArrayList<String> names = new ArrayList<>();
+            ArrayList<UsbSerialPort.FlowControl> values = new ArrayList<>();
+            int pos = 0;
+            names.add("<none>");
+            values.add(UsbSerialPort.FlowControl.NONE);
+            if (sfc.contains(UsbSerialPort.FlowControl.RTS_CTS)) {
+                names.add("RTS/CTS control lines");
+                values.add(UsbSerialPort.FlowControl.RTS_CTS);
+                if (fc == UsbSerialPort.FlowControl.RTS_CTS) pos = names.size() -1;
+            }
+            if (sfc.contains(UsbSerialPort.FlowControl.DTR_DSR)) {
+                names.add("DTR/DSR control lines");
+                values.add(UsbSerialPort.FlowControl.DTR_DSR);
+                if (fc == UsbSerialPort.FlowControl.DTR_DSR) pos = names.size() - 1;
+            }
+            if (sfc.contains(UsbSerialPort.FlowControl.XON_XOFF)) {
+                names.add("XON/XOFF characters");
+                values.add(UsbSerialPort.FlowControl.XON_XOFF);
+                if (fc == UsbSerialPort.FlowControl.XON_XOFF) pos = names.size() - 1;
+            }
+            if (sfc.contains(UsbSerialPort.FlowControl.XON_XOFF_INLINE)) {
+                names.add("XON/XOFF characters");
+                values.add(UsbSerialPort.FlowControl.XON_XOFF_INLINE);
+                if (fc == UsbSerialPort.FlowControl.XON_XOFF_INLINE) pos = names.size() - 1;
+            }
+            AlertDialog.Builder builder = new AlertDialog.Builder(getActivity());
+            builder.setTitle("Flow Control");
+            builder.setSingleChoiceItems(names.toArray(new CharSequence[0]), pos, (dialog, which) -> {
+                dialog.dismiss();
+                try {
+                    flowControl = values.get(which);
+                    usbSerialPort.setFlowControl(flowControl);
+                    flowControlFilter = usbSerialPort.getFlowControl() == UsbSerialPort.FlowControl.XON_XOFF_INLINE ? new XonXoffFilter() : null;
+                    start();
+                } catch (Exception e) {
+                    status("Set flow control failed: "+e.getClass().getName()+" "+e.getMessage());
+                    flowControl = UsbSerialPort.FlowControl.NONE;
+                    flowControlFilter = null;
+                    start();
+                }
+            });
+            builder.setNegativeButton("Cancel", (dialog, which) -> dialog.dismiss());
+            builder.setNeutralButton("Info", (dialog, which) -> {
+                dialog.dismiss();
+                AlertDialog.Builder builder2 = new AlertDialog.Builder(getActivity());
+                builder2.setTitle("Flow Control").setMessage("If send is stopped by the external device, the 'Send' button changes to 'Blocked' icon.");
+                builder2.create().show();
+            });
+            builder.create().show();
+        }
+
+        public boolean showControlLines(boolean show) {
+            showControlLines = show;
+            start();
+            return showControlLines;
+        }
+
+        void start() {
+            if (showControlLines) {
+                try {
+                    EnumSet<UsbSerialPort.ControlLine> lines = usbSerialPort.getSupportedControlLines();
+                    rtsBtn.setVisibility(lines.contains(UsbSerialPort.ControlLine.RTS) ? View.VISIBLE : View.INVISIBLE);
+                    ctsBtn.setVisibility(lines.contains(UsbSerialPort.ControlLine.CTS) ? View.VISIBLE : View.INVISIBLE);
+                    dtrBtn.setVisibility(lines.contains(UsbSerialPort.ControlLine.DTR) ? View.VISIBLE : View.INVISIBLE);
+                    dsrBtn.setVisibility(lines.contains(UsbSerialPort.ControlLine.DSR) ? View.VISIBLE : View.INVISIBLE);
+                    cdBtn.setVisibility(lines.contains(UsbSerialPort.ControlLine.CD)   ? View.VISIBLE : View.INVISIBLE);
+                    riBtn.setVisibility(lines.contains(UsbSerialPort.ControlLine.RI)   ? View.VISIBLE : View.INVISIBLE);
+                } catch (IOException e) {
+                    showControlLines = false;
+                    status("getSupportedControlLines() failed: " + e.getMessage());
+                }
+            }
+            frame.setVisibility(showControlLines ? View.VISIBLE : View.GONE);
+            if(flowControl == UsbSerialPort.FlowControl.NONE) {
+                sendAllowed = true;
+                updateSendBtn(SendButtonState.Idle);
+            }
+
+            mainLooper.removeCallbacks(runnable);
+            if (showControlLines || flowControl != UsbSerialPort.FlowControl.NONE) {
+                run();
+            }
+        }
+
+        void stop() {
+            mainLooper.removeCallbacks(runnable);
+            sendAllowed = true;
+            updateSendBtn(SendButtonState.Idle);
+            rtsBtn.setChecked(false);
+            ctsBtn.setChecked(false);
+            dtrBtn.setChecked(false);
+            dsrBtn.setChecked(false);
+            cdBtn.setChecked(false);
+            riBtn.setChecked(false);
+        }
+
+        private void run() {
+            if (connected != Connected.True)
+                return;
+            try {
+                if (showControlLines) {
+                    EnumSet<UsbSerialPort.ControlLine> lines = usbSerialPort.getControlLines();
+                    if(rtsBtn.isChecked() != lines.contains(UsbSerialPort.ControlLine.RTS)) rtsBtn.setChecked(!rtsBtn.isChecked());
+                    if(ctsBtn.isChecked() != lines.contains(UsbSerialPort.ControlLine.CTS)) ctsBtn.setChecked(!ctsBtn.isChecked());
+                    if(dtrBtn.isChecked() != lines.contains(UsbSerialPort.ControlLine.DTR)) dtrBtn.setChecked(!dtrBtn.isChecked());
+                    if(dsrBtn.isChecked() != lines.contains(UsbSerialPort.ControlLine.DSR)) dsrBtn.setChecked(!dsrBtn.isChecked());
+                    if(cdBtn.isChecked()  != lines.contains(UsbSerialPort.ControlLine.CD))  cdBtn.setChecked(!cdBtn.isChecked());
+                    if(riBtn.isChecked()  != lines.contains(UsbSerialPort.ControlLine.RI))  riBtn.setChecked(!riBtn.isChecked());
+                }
+                if (flowControl != UsbSerialPort.FlowControl.NONE) {
+                    switch (usbSerialPort.getFlowControl()) {
+                        case DTR_DSR:         sendAllowed = usbSerialPort.getDSR(); break;
+                        case RTS_CTS:         sendAllowed = usbSerialPort.getCTS(); break;
+                        case XON_XOFF:        sendAllowed = usbSerialPort.getXON(); break;
+                        case XON_XOFF_INLINE: sendAllowed = flowControlFilter != null && flowControlFilter.getXON(); break;
+                        default:              sendAllowed = true;
+                    }
+                    updateSendBtn(sendAllowed ? SendButtonState.Idle : SendButtonState.Disabled);
+                }
+                mainLooper.postDelayed(runnable, refreshInterval);
+            } catch (IOException e) {
+                status("getControlLines() failed: " + e.getMessage() + " -> stopped control line refresh");
+            }
         }
 
         private void toggle(View v) {
@@ -524,51 +670,6 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
             }
         }
 
-        private void run() {
-            if (connected != Connected.True)
-                return;
-            try {
-                EnumSet<UsbSerialPort.ControlLine> controlLines = usbSerialPort.getControlLines();
-                if(rtsBtn.isChecked() != controlLines.contains(UsbSerialPort.ControlLine.RTS)) rtsBtn.setChecked(!rtsBtn.isChecked());
-                if(ctsBtn.isChecked() != controlLines.contains(UsbSerialPort.ControlLine.CTS)) ctsBtn.setChecked(!ctsBtn.isChecked());
-                if(dtrBtn.isChecked() != controlLines.contains(UsbSerialPort.ControlLine.DTR)) dtrBtn.setChecked(!dtrBtn.isChecked());
-                if(dsrBtn.isChecked() != controlLines.contains(UsbSerialPort.ControlLine.DSR)) dsrBtn.setChecked(!dsrBtn.isChecked());
-                if(cdBtn.isChecked()  != controlLines.contains(UsbSerialPort.ControlLine.CD))   cdBtn.setChecked(!cdBtn.isChecked());
-                if(riBtn.isChecked()  != controlLines.contains(UsbSerialPort.ControlLine.RI))   riBtn.setChecked(!riBtn.isChecked());
-                mainLooper.postDelayed(runnable, refreshInterval);
-            } catch (IOException e) {
-                status("getControlLines() failed: " + e.getMessage() + " -> stopped control line refresh");
-            }
-        }
-
-        void start() {
-            frame.setVisibility(View.VISIBLE);
-            if (connected != Connected.True)
-                return;
-            try {
-                EnumSet<UsbSerialPort.ControlLine> controlLines = usbSerialPort.getSupportedControlLines();
-                if (!controlLines.contains(UsbSerialPort.ControlLine.RTS)) rtsBtn.setVisibility(View.INVISIBLE);
-                if (!controlLines.contains(UsbSerialPort.ControlLine.CTS)) ctsBtn.setVisibility(View.INVISIBLE);
-                if (!controlLines.contains(UsbSerialPort.ControlLine.DTR)) dtrBtn.setVisibility(View.INVISIBLE);
-                if (!controlLines.contains(UsbSerialPort.ControlLine.DSR)) dsrBtn.setVisibility(View.INVISIBLE);
-                if (!controlLines.contains(UsbSerialPort.ControlLine.CD))   cdBtn.setVisibility(View.INVISIBLE);
-                if (!controlLines.contains(UsbSerialPort.ControlLine.RI))   riBtn.setVisibility(View.INVISIBLE);
-                run();
-            } catch (IOException e) {
-                Toast.makeText(getActivity(), "getSupportedControlLines() failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-            }
-        }
-
-        void stop() {
-            frame.setVisibility(View.GONE);
-            mainLooper.removeCallbacks(runnable);
-            rtsBtn.setChecked(false);
-            ctsBtn.setChecked(false);
-            dtrBtn.setChecked(false);
-            dsrBtn.setChecked(false);
-            cdBtn.setChecked(false);
-            riBtn.setChecked(false);
-        }
     }
 
 }

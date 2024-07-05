@@ -21,6 +21,10 @@
         android:checkable="true"
         app:showAsAction="never" />
     <item
+        android:id="@+id/flowControl"
+        android:title="Flow Control"
+        app:showAsAction="never" />
+    <item
         android:id="@+id/backgroundNotification"
         android:title="Notification if App in background"
         android:checkable="true"
