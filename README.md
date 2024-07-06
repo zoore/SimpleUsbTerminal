@@ -14,11 +14,16 @@ and devices implementing the USB CDC protocol like
 - Arduino using ATmega32U4
 - Digispark using V-USB software USB
 - BBC micro:bit using ARM mbed DAPLink firmware
+- Pi Pico
+- ...
 
 ## Features
 
 - permission handling on device connection
 - foreground service to buffer receive data while the app is rotating, in background, ...
+- send BREAK
+- show control lines
+- RTS/CTS, DTR/DSR, XON/XOFF flow control
 
 ## Credits
 
